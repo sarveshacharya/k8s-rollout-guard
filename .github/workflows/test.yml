@@ -53,7 +53,7 @@ jobs:
 
       # --- Failure path: a bad image must be diagnosed, rolled back, and fail ---
       - name: Break the deployment
-        run: kubectl -n demo set image deployment/app app=nginx:this-tag-does-not-exist
+        run: kubectl -n demo set image deployment/app '*=nginx:this-tag-does-not-exist'
 
       - name: Guard a broken rollout (expect failure + rollback)
         id: guard
