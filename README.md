@@ -110,6 +110,23 @@ Or pin to an exact release / commit SHA for maximum reproducibility:
 uses: sarveshacharya/k8s-rollout-guard@v1.0.0
 ```
 
+## Releasing (maintainers)
+
+Cutting a release is a single tag push — the [`Release` workflow](.github/workflows/release.yml)
+does the rest:
+
+```bash
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+On that push it (re)points the moving major tag `v1` at the release commit and
+creates a GitHub Release with generated notes. Consumers pinned to `@v1` pick up
+the new version automatically; nothing else is done by hand.
+
+> First release only: the `v1` tag is created the first time you push a `v1.x.x`
+> tag. Until then, `uses: …@v1` cannot resolve.
+
 ## License
 
 [MIT](./LICENSE)
