@@ -1,0 +1,82 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint (actionlint + shellcheck)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: actionlint
+        uses: raven-actions/actionlint@v2
+      - name: shellcheck the embedded script
+        run: |
+          # Extract the composite step's `run:` script and shellcheck it.
+          python3 - <<'PY' > /tmp/rollout.sh
+          import yaml
+          d = yaml.safe_load(open("action.yml"))
+          print("#!/usr/bin/env bash")
+          print(d["runs"]["steps"][0]["run"])
+          PY
+          sudo apt-get update && sudo apt-get install -y shellcheck
+          shellcheck -S warning /tmp/rollout.sh
+
+  e2e:
+    name: E2E on kind
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create kind cluster
+        uses: helm/kind-action@v1
+
+      - name: Seed a healthy deployment
+        run: |
+          kubectl create namespace demo
+          kubectl -n demo create deployment app --image=nginx:1.27-alpine
+          kubectl -n demo rollout status deployment/app --timeout=120s
+
+      # --- Happy path: a healthy rollout must succeed ---
+      - name: Guard a healthy rollout (expect success)
+        uses: ./
+        with:
+          deployment: app
+          namespace: demo
+          timeout: 120s
+
+      # --- Failure path: a bad image must be diagnosed, rolled back, and fail ---
+      - name: Break the deployment
+        run: kubectl -n demo set image deployment/app app=nginx:this-tag-does-not-exist
+
+      - name: Guard a broken rollout (expect failure + rollback)
+        id: guard
+        continue-on-error: true
+        uses: ./
+        with:
+          deployment: app
+          namespace: demo
+          timeout: 45s
+
+      - name: Assert the step failed and rolled back to the good image
+        run: |
+          if [ "${{ steps.guard.outcome }}" != "failure" ]; then
+            echo "::error::Expected the guard step to fail on a broken rollout, got '${{ steps.guard.outcome }}'"
+            exit 1
+          fi
+          # After rollback, the deployment should be back on the working image and Available.
+          kubectl -n demo rollout status deployment/app --timeout=120s
+          IMAGE="$(kubectl -n demo get deployment/app -o jsonpath='{.spec.template.spec.containers[0].image}')"
+          echo "Current image after rollback: ${IMAGE}"
+          case "${IMAGE}" in
+            *this-tag-does-not-exist*)
+              echo "::error::Rollback did not occur; deployment still on the bad image"
+              exit 1 ;;
+          esac
+          echo "✅ Rollback restored a healthy revision."
