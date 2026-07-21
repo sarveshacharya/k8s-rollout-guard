@@ -1,0 +1,138 @@
+name: 'Kubernetes Rollout Guard'
+description: >-
+  Wait for a Kubernetes Deployment rollout to become ready within a timeout.
+  On failure, surface the real error (deployment/pod describe, current +
+  previous container logs, namespace events) in the job log and step summary,
+  then roll back to the previous revision and fail the job. kubectl must
+  already be authenticated against the target cluster.
+author: 'Sarvesh Acharya'
+
+branding:
+  icon: 'rotate-ccw'
+  color: 'blue'
+
+inputs:
+  deployment:
+    description: 'Deployment name (used as `deployment/<name>`).'
+    required: true
+  namespace:
+    description: 'Kubernetes namespace the deployment lives in.'
+    required: true
+  timeout:
+    description: >-
+      Max time to wait for the rollout to become ready (and for the rollback to
+      become healthy afterwards), e.g. "300s", "10m". Keep this generous: a
+      slow-but-healthy rollout must NOT be treated as a failure and rolled back.
+    required: false
+    default: '300s'
+  rollback:
+    description: >-
+      Whether to run `kubectl rollout undo` when the rollout fails. Set to
+      "false" to collect diagnostics and fail the job without rolling back
+      (e.g. if you prefer to roll back manually).
+    required: false
+    default: 'true'
+  log-tail:
+    description: 'Number of log lines to capture per container when diagnosing a failure.'
+    required: false
+    default: '200'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Wait for rollout (diagnostics + auto-rollback)
+      shell: bash
+      env:
+        # Passed via env (not inline ${{ }}) to avoid shell-injection / quoting issues.
+        DEPLOYMENT: ${{ inputs.deployment }}
+        NAMESPACE: ${{ inputs.namespace }}
+        ROLLOUT_TIMEOUT: ${{ inputs.timeout }}
+        ROLLBACK: ${{ inputs.rollback }}
+        LOG_TAIL: ${{ inputs.log-tail }}
+      run: |
+        set -uo pipefail
+
+        echo "⏳ Waiting for rollout of deployment/${DEPLOYMENT} in namespace ${NAMESPACE} (timeout: ${ROLLOUT_TIMEOUT})..."
+
+        if kubectl rollout status "deployment/${DEPLOYMENT}" -n "${NAMESPACE}" --timeout="${ROLLOUT_TIMEOUT}"; then
+          echo "✅ Rollout completed successfully."
+          exit 0
+        fi
+
+        echo "::error title=Rollout failed::deployment/${DEPLOYMENT} in ${NAMESPACE} did not become ready within ${ROLLOUT_TIMEOUT}"
+
+        # ---------------------------------------------------------------------
+        # 1) Collect the actual error so developers can debug from the run logs.
+        # ---------------------------------------------------------------------
+        echo "::group::Deployment status & events"
+        kubectl describe "deployment/${DEPLOYMENT}" -n "${NAMESPACE}" || true
+        echo "::endgroup::"
+
+        # Pods created by this deployment are name-prefixed with the deployment name.
+        PODS="$(kubectl get pods -n "${NAMESPACE}" --no-headers 2>/dev/null | awk '{print $1}' | grep "^${DEPLOYMENT}-" || true)"
+
+        echo "::group::Pod overview"
+        kubectl get pods -n "${NAMESPACE}" -o wide 2>/dev/null | { grep -E "^(NAME|${DEPLOYMENT}-)" || true; }
+        echo "::endgroup::"
+
+        for POD in ${PODS}; do
+          echo "::group::describe pod/${POD}"
+          kubectl describe "pod/${POD}" -n "${NAMESPACE}" || true
+          echo "::endgroup::"
+
+          echo "::group::logs pod/${POD} (current)"
+          kubectl logs "pod/${POD}" -n "${NAMESPACE}" --all-containers=true --tail="${LOG_TAIL}" || true
+          echo "::endgroup::"
+
+          echo "::group::logs pod/${POD} (previous / crashed container)"
+          kubectl logs "pod/${POD}" -n "${NAMESPACE}" --all-containers=true --previous --tail="${LOG_TAIL}" 2>/dev/null || echo "(no previous container logs)"
+          echo "::endgroup::"
+        done
+
+        echo "::group::Recent namespace events"
+        kubectl get events -n "${NAMESPACE}" --sort-by=.lastTimestamp 2>/dev/null | tail -n 40 || true
+        echo "::endgroup::"
+
+        # ---------------------------------------------------------------------
+        # 2) Cancel the failed rollout and revert to the previous revision.
+        #    NOTE: "undo" reverts to the PREVIOUS revision, which is only the
+        #    last *stable* one if the prior deploy succeeded. First-ever deploy
+        #    or two failures in a row => nothing good to roll back to.
+        # ---------------------------------------------------------------------
+        ROLLBACK_STATUS="disabled"
+        if [ "${ROLLBACK}" = "true" ]; then
+          echo "⏪ Rolling back deployment/${DEPLOYMENT} to the previous revision..."
+          ROLLBACK_STATUS="failed"
+          if kubectl rollout undo "deployment/${DEPLOYMENT}" -n "${NAMESPACE}"; then
+            if kubectl rollout status "deployment/${DEPLOYMENT}" -n "${NAMESPACE}" --timeout="${ROLLOUT_TIMEOUT}"; then
+              ROLLBACK_STATUS="succeeded"
+            else
+              ROLLBACK_STATUS="unhealthy"
+            fi
+          fi
+        else
+          echo "↩️  Rollback disabled (rollback: false) — leaving the failed revision in place."
+        fi
+
+        # ---------------------------------------------------------------------
+        # 3) Report the ACTUAL outcome (written after the rollback is attempted).
+        # ---------------------------------------------------------------------
+        {
+          echo "## 🚨 Rollout failed: \`${DEPLOYMENT}\` (\`${NAMESPACE}\`)"
+          echo ""
+          echo "The new revision did not become ready within \`${ROLLOUT_TIMEOUT}\`. Full diagnostics (describe, pod logs, events) are in the failed step's log groups."
+          echo ""
+          case "${ROLLBACK_STATUS}" in
+            succeeded)
+              echo "✅ **Rollback:** reverted to the previous revision and it is healthy." ;;
+            unhealthy)
+              echo "⚠️ **Rollback:** \`kubectl rollout undo\` ran, but the previous revision did not become healthy within \`${ROLLOUT_TIMEOUT}\`. **Manual intervention required.**" ;;
+            disabled)
+              echo "ℹ️ **Rollback:** disabled via \`rollback: false\`. The failed revision is still current." ;;
+            *)
+              echo "❌ **Rollback did NOT happen:** \`kubectl rollout undo\` failed — no rollout history, insufficient RBAC, or nothing to revert to. **The failed revision is still current; manual intervention required.**" ;;
+          esac
+        } >> "${GITHUB_STEP_SUMMARY}"
+
+        echo "::error::Deployment ${DEPLOYMENT} failed; rollback ${ROLLBACK_STATUS}. See diagnostics above."
+        exit 1
